@@ -8,6 +8,7 @@ import json
 import re
 import shutil
 import sys
+import sqlite3
 import zipfile
 
 from bs4 import BeautifulSoup, Comment
@@ -23,9 +24,11 @@ logging.basicConfig(level=logging.DEBUG)
 
 css_parser.log.setLevel(logging.INFO)
 
-docs_dir = Path("dist/leaflet.docset/Contents/Resources/Documents")
+docs_dir = Path("dist/Leaflet.docset/Contents/Resources/Documents")
 
-# os.system(f"wget --convert-links --page-requisites --directory-prefix={docs_dir.absolute()} https://leafletjs.com/reference.html")
+os.system("rm -rf dist/Leaflet.docset/Contents/Resources/Documents/*")
+os.system("rm -rf dist/Leaflet.docset/Contents/Resources/docSet.dsidx")
+os.system(f"wget --convert-links --page-requisites --directory-prefix={docs_dir.absolute()} https://leafletjs.com/reference.html")
 
 leaflet_dir = docs_dir / "leafletjs.com"
 
@@ -141,7 +144,17 @@ for tag_index in range(len_code_tags):
         docset_soup.select(highlight_class)[0].append(pre_css_tag)
         logging.debug(f"({tag_index+1}/{len_code_tags}) syntax highlighting done")
 
+logging.debug(f"completed syntax highlighting")
+
 docset_soup.body.append(BeautifulSoup(f"<script src=\"docs/js/reference.js\"></script>", features="html.parser").select('script')[0])
+
+# 'nobr' is deprecated -> also see: https://developer.mozilla.org/en-US/docs/Web/HTML/Element/nobr
+for tag in docset_soup.select('nobr'):
+    tag.name = 'span'
+    tag['style'] = 'white-space: nowrap;'
+
+for tag in docset_soup.select('b'):
+    tag.name = 'strong'
 
 css_links = docset_soup.select('link[rel="stylesheet"]')
 css_styles = ''
@@ -252,16 +265,17 @@ css_styles = str(re.sub(r'(?m)( ){2}', '', css_styles))
 
 new_css_len = len(css_styles)
 
-css_files = list(static_dir.glob('*.css'))
+css_dir = static_dir / "css"
+css_files = list(css_dir.glob('*.css'))
 
 logging.debug(f"found {len(css_files)} obsolete css files")
 #pprint(js_files)
 for css_file in css_files:
     logging.debug(f"deleting '{css_file}' ... ")
-    # try:
-    #     css_file.unlink()
-    # except Exception as e:
-    #     logging.error(f"failed to delete '{css_file}' -> error: {e}")
+    try:
+        css_file.unlink()
+    except Exception as e:
+        logging.error(f"failed to delete '{css_file}' -> error: {e}")
 
 css_len_diff = old_css_len - new_css_len
 css_len_percent = css_len_diff / old_css_len * 100
@@ -353,24 +367,88 @@ for tag in docset_soup.body.children:
     if isinstance(tag, Comment): # remove html comments
         tag.decompose()
 
+db_path = Path("dist/Leaflet.docset/Contents/Resources/docSet.dsidx")
+
+logging.debug("creating sql table and index ... ")
+sqlitedb = sqlite3.connect(str(db_path))
+cur = sqlitedb.cursor()
+cur.execute("CREATE TABLE IF NOT EXISTS searchIndex(id INTEGER PRIMARY KEY, name TEXT, type TEXT, path TEXT);")
+cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS anchor ON searchIndex (name, type, path);")
+logging.debug("created sql table and index")
+
 nodes_list = []
-for table_tag in docset_soup.select('section table'):
+node_ids = {}
+table_tags = docset_soup.select('section table')
+len_table_tags = len(table_tags)
+for table_tag_index in range(len_table_tags):
+    logging.debug(f"({table_tag_index+1}/{len_table_tags}) processing tables ... ")
+    table_tag = table_tags[table_tag_index]
     type_str = table_tag.select('thead > tr > th:first-of-type')
+    
+    # get section heading
+    table_heading = table_tag.find_previous("h2")
+    if table_heading is not None:
+        table_heading = str(table_heading.text)
+    else:
+        table_heading = ''
+
     if len(type_str) == 1:
         type_str = html.unescape(re.sub(r'(?im)<[^>]+>','',str(type_str[0])))
-        print(f"type -> {type_str}")
-        for node_tag in table_tag.select('tbody > tr > td:first-of-type'):
+        
+        if type_str.lower() == 'crs':
+            type_str = 'Constant'
+        elif type_str.lower() == 'pane':
+            type_str = 'Element'
+
+        node_tags = table_tag.select('tbody > tr > td:first-of-type')
+        for node_tag_index in range(len(node_tags)):
+            node_tag = node_tags[node_tag_index]
+
+            node_id = str(node_tag.parent.get('id'))
+            if len(node_id.replace('None','').strip()) == 0:
+                node_id = str(re.sub(r'(?m)[\W]+','',str(table_heading))).lower() + '-' + str(re.sub(r'(?m)[A-z]+','',str(node_str))).lower()
+            else:
+                node_id = str(re.sub(r'(?m)[^\w\-]+','',str(node_id))).lower()
+
+            # create unique id values
+            if node_id in node_ids:
+                id_count = node_ids[node_id]
+                node_ids[node_id] += 1
+                node_id += str(id_count+1)
+                node_tag.parent['id'] = node_id
+            else:
+                node_ids[node_id] = 1
+
             node_str = html.unescape(re.sub(r'(?im)<[^>]+>','',str(node_tag)))
             nodes_list.append({
-                'type':type_str,
-                'name':node_str
+                'type': type_str,
+                'name': node_str,
+                'path': "leafletjs.com/reference.html#" + node_id
             })
-            print(f"     node -> {str(node_str)}")
+
+            anchor_tag = docset_soup.new_tag("a")
+            anchor_tag['href'] = '#' + node_id
+            anchor_tag['data-anchor'] = node_id
+            anchor_tag.string = ''
+            node_tag.append(anchor_tag)
+
+logging.debug(f"processed tables")
 
 with open("nodes.json", 'w+', encoding='utf-8') as fh:
-    fh.write(str(json.dumps(nodes_list)))
+    fh.write(str(json.dumps(nodes_list, indent=4)))
 
-docset_soup = str(docset_soup)
+nodes_list_len = len(nodes_list)
+for node_index in range(nodes_list_len):
+    node = nodes_list[node_index]
+    logging.debug(f"({node_index+1}/{nodes_list_len}) inserting nodes into db ...")
+    sqlitedb = sqlite3.connect(str(db_path))
+    cur = sqlitedb.cursor()
+    cur.execute(f"INSERT OR IGNORE INTO searchIndex(name, type, path) VALUES ('{node['name']}', '{node['type']}', '{node['path']}');")
+    sqlitedb.commit()
+
+logging.debug(f"completed inserting of nodes")
+
+index_html = str(docset_soup)
 
 js_path = static_dir / "js"
 js_files = list(js_path.glob('*.js'))
@@ -379,12 +457,12 @@ logging.debug(f"found {len(js_files)} javascript files")
 #pprint(js_files)
 for js_file in js_files:
     js_fn = str(js_file.stem+js_file.suffix)
-    if js_fn not in docset_soup:
+    if js_fn not in index_html:
         logging.debug(f"deleting '{js_file}' ... ")
-        # try:
-        #     js_file.unlink()
-        # except Exception as e:
-        #     logging.error(f"failed to delete '{js_file}' -> error: {e}")
+        try:
+            js_file.unlink()
+        except Exception as e:
+            logging.error(f"failed to delete '{js_file}' -> error: {e}")
 
 img_path = static_dir / "images"
 img_files = list(img_path.glob('*.*'))
@@ -393,17 +471,24 @@ logging.debug(f"found {len(img_files)} image files")
 pprint(img_files)
 for img_file in img_files:
     img_fn = str(img_file.stem+img_file.suffix)
-    if img_fn not in docset_soup and img_fn not in css_styles:
+    if img_fn not in index_html and img_fn not in css_styles:
         logging.debug(f"deleting '{img_file}' ... ")
-        # try:
-        #     img_file.unlink()
-        # except Exception as e:
-        #     logging.error(f"failed to delete '{img_file}' -> error: {e}")
+        try:
+            img_file.unlink()
+        except Exception as e:
+            logging.error(f"failed to delete '{img_file}' -> error: {e}")
 
 index_len = len(index_html)
 
 logging.debug(f"removed surplus contents -> new length: {index_len} ")
 
-ref_path = leaflet_dir / "index.html"
-with open(ref_path, 'w+', encoding='utf-8') as fh:
-    fh.write(str(docset_soup))
+ref_path = leaflet_dir / "reference.html"
+try:
+    with open(ref_path, "w+", encoding="utf-8") as fh:
+        fh.write(htmlmin.minify(index_html, remove_empty_space=True))
+except Exception as e:
+    logging.error(f"minification of '{ref_path}' failed -> error: {e} ")
+    with open(ref_path, 'w+', encoding='utf-8') as fh:
+        fh.write(index_html)
+
+os.system("cd dist && tar --exclude='.DS_Store' -cvzf Leaflet.tgz Leaflet.docset")
