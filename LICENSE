@@ -1,4 +1,6 @@
-Documentation generation scripts copyright (c) 2013, Drew Dara-Abrams
+Rewritten in Python3 and updated by Henning Weller in 2022.
+
+The original documentation generation scripts are protected by copyright (c) 2013, Drew Dara-Abrams
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without modification,
